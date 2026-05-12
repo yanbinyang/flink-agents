@@ -15,7 +15,9 @@
 #  See the License for the specific language governing permissions and
 # limitations under the License.
 #################################################################################
+import os
 import tempfile
+from contextlib import suppress
 from typing import Any
 from unittest.mock import MagicMock, create_autospec
 
@@ -37,6 +39,17 @@ from flink_agents.integrations.vector_stores.mem0.mem0_vector_store import (
     Mem0VectorStore,
 )
 from flink_agents.runtime.memory.mem0.mem0_long_term_memory import Mem0LongTermMemory
+
+try:
+    import pymilvus  # noqa: F401
+
+    _milvus_available = True
+except ImportError:
+    _milvus_available = False
+
+_milvus_uri = os.environ.get("MILVUS_URI")
+_milvus_test_db = "flink_agents_mem0_ltm_test"
+_milvus_strong_consistency = "Strong"
 
 
 class MockChatModelSetup:
@@ -121,6 +134,8 @@ def _build_vector_store(backend: str, tmpdir: str) -> CollectionManageableVector
     - ``"mem0"`` — the reverse adapter :class:`Mem0VectorStore` wrapping
       Mem0's native chroma provider. Exercises the double-wrap path
       (Mem0 → FlinkAgentsMem0VectorStore → Mem0VectorStore → Mem0 chroma).
+    - ``"mem0_milvus"`` — the same reverse adapter backed by Mem0's native
+      Milvus provider.
     """
     if backend == "chroma":
         return ChromaVectorStore(
@@ -134,12 +149,34 @@ def _build_vector_store(backend: str, tmpdir: str) -> CollectionManageableVector
             provider_config={"path": tmpdir},
             collection="test_mem0",
         )
+    if backend == "mem0_milvus":
+        return Mem0VectorStore(
+            provider="milvus",
+            provider_config={
+                "url": _milvus_uri,
+                "token": None,
+                "embedding_model_dims": 384,
+                "metric_type": "COSINE",
+                "db_name": _milvus_test_db,
+            },
+            collection="test_mem0",
+        )
     msg = f"Unknown backend: {backend}"
     raise ValueError(msg)
 
 
-@pytest.fixture(scope="module", params=["chroma", "mem0"])
+@pytest.fixture(scope="module", params=["chroma", "mem0", "mem0_milvus"])
 def mock_ctx(request):
+    patch = None
+    if request.param == "mem0_milvus":
+        if not _milvus_available:
+            pytest.skip("pymilvus is not available")
+        if not _milvus_uri:
+            pytest.skip("MILVUS_URI is not set")
+        _clear_milvus_test_database()
+        patch = pytest.MonkeyPatch()
+        _use_strong_milvus_consistency(patch)
+
     ctx = create_autospec(RunnerContext, instance=True)
     ctx.config = MagicMock()
     ctx.config.get = MagicMock(side_effect=lambda opt: None)
@@ -161,7 +198,40 @@ def mock_ctx(request):
         return None
 
     ctx.get_resource = get_resource
-    return ctx
+    try:
+        yield ctx
+    finally:
+        with suppress(Exception):
+            vector_store.delete_collection("test_mem0")
+        if request.param == "mem0_milvus" and _milvus_available and _milvus_uri:
+            _clear_milvus_test_database()
+        if patch is not None:
+            patch.undo()
+
+
+def _use_strong_milvus_consistency(monkeypatch) -> None:
+    import mem0.vector_stores.milvus as mem0_milvus
+
+    class StrongConsistencyMilvusClient(mem0_milvus.MilvusClient):
+        def create_collection(self, *args: Any, **kwargs: Any) -> Any:
+            # Test-only: use STRONG consistency so the existing LTM contract
+            # tests can assert read-after-write behavior without sleeps/retries.
+            kwargs.setdefault("consistency_level", _milvus_strong_consistency)
+            return super().create_collection(*args, **kwargs)
+
+    monkeypatch.setattr(mem0_milvus, "MilvusClient", StrongConsistencyMilvusClient)
+
+
+def _clear_milvus_test_database() -> None:
+    from pymilvus import MilvusClient
+
+    root_client = MilvusClient(uri=_milvus_uri, token=None)
+    if _milvus_test_db not in root_client.list_databases():
+        root_client.create_database(_milvus_test_db)
+
+    client = MilvusClient(uri=_milvus_uri, token=None, db_name=_milvus_test_db)
+    for name in client.list_collections():
+        client.drop_collection(name)
 
 
 @pytest.fixture(scope="module")

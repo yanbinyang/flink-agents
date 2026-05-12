@@ -143,8 +143,11 @@ class Mem0VectorStore(CollectionManageableVectorStore):
         **kwargs: Any,
     ) -> List[Document]:
         store = self._get_existing(collection_name)
+        # Mem0 providers are not fully uniform here: Chroma expects a batch of
+        # query embeddings, while Milvus follows Mem0's own single-vector path.
+        vectors: Any = [embedding] if self.provider.lower() == "chroma" else embedding
         results = store.search(
-            query="", vectors=[embedding], limit=limit, filters=filters
+            query="", vectors=vectors, limit=limit, filters=filters
         )
         return [_mem0_output_to_document(r) for r in results]
 
@@ -174,12 +177,21 @@ class Mem0VectorStore(CollectionManageableVectorStore):
         if ids is not None:
             docs: List[Document] = []
             for id_ in _maybe_cast_to_list(ids):
-                output = store.get(vector_id=id_)
+                try:
+                    output = store.get(vector_id=id_)
+                except IndexError:
+                    continue
                 if output is None or getattr(output, "id", None) is None:
                     continue
                 docs.append(_mem0_output_to_document(output))
             return docs
-        listed = store.list(filters=filters, limit=limit)
+        # Mem0's Milvus backend rejects ``limit=None``; omitting the argument
+        # lets the backend use its own bounded default instead of failing.
+        listed = (
+            store.list(filters=filters)
+            if limit is None
+            else store.list(filters=filters, limit=limit)
+        )
         return [_mem0_output_to_document(r) for r in _flatten_list(listed)]
 
     @override

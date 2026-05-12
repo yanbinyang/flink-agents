@@ -59,6 +59,7 @@ dependencies = [
     "chromadb==1.0.21",
     "mem0ai>=0.1.43,<2.0.0",
     "onnxruntime<1.24.1;python_version<'3.11'",
+    "pymilvus==2.6.12",
 ]
 
 [tool.setuptools]

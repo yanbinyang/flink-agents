@@ -18,6 +18,8 @@
 from __future__ import annotations
 
 import hashlib
+import os
+from contextlib import suppress
 from typing import Any, Dict, List
 
 import pytest
@@ -61,6 +63,21 @@ if _backend_available:
     from flink_agents.integrations.vector_stores.mem0.mem0_vector_store import (
         Mem0VectorStore,
     )
+else:
+    Mem0VectorStore = object  # type: ignore[assignment]
+
+try:
+    import pymilvus  # noqa: F401
+
+    _milvus_available = True
+except ImportError:
+    _milvus_available = False
+
+_milvus_uri = os.environ.get("MILVUS_URI")
+_milvus_test_db = "flink_agents_mem0_test"
+_milvus_strong_consistency = "Strong"
+_mem0_provider = "chroma"
+_created_stores: List[Any] = []
 
 pytestmark = pytest.mark.skipif(
     not _backend_available, reason="mem0 / chromadb is not available"
@@ -70,20 +87,86 @@ pytestmark = pytest.mark.skipif(
 # ---------------------------------------------------------------------------
 # Test harness
 # ---------------------------------------------------------------------------
+@pytest.fixture(params=["chroma", "milvus"], autouse=True)
+def _vector_store_suite(request, monkeypatch) -> None:
+    global _created_stores, _mem0_provider
+
+    _mem0_provider = request.param
+    _created_stores = []
+    if _mem0_provider == "milvus":
+        if not _milvus_available:
+            pytest.skip("pymilvus is not available")
+        if not _milvus_uri:
+            pytest.skip("MILVUS_URI is not set")
+        _clear_milvus_test_database()
+        _use_strong_milvus_consistency(monkeypatch)
+
+    try:
+        yield
+    finally:
+        for store in _created_stores:
+            for name in list(store._stores):
+                with suppress(Exception):
+                    store.delete_collection(name)
+        if _mem0_provider == "milvus" and _milvus_available and _milvus_uri:
+            _clear_milvus_test_database()
+        _mem0_provider = "chroma"
+        _created_stores = []
+
+
 def _make_store(tmp_path, *, collection: str = "default_col") -> Mem0VectorStore:
-    """Construct a :class:`Mem0VectorStore` backed by Mem0's chroma provider
-    in persistent mode under ``tmp_path``.
+    """Construct a :class:`Mem0VectorStore` backed by the active Mem0 provider.
 
     No ``embedding_model`` is configured: Mem0 always hands us pre-computed
     vectors, so the reverse adapter never needs to auto-embed.
     """
+    if _mem0_provider == "chroma":
+        provider_config = {"path": str(tmp_path)}
+    elif _mem0_provider == "milvus":
+        provider_config = {
+            "url": _milvus_uri,
+            "token": None,
+            "embedding_model_dims": 8,
+            "metric_type": "COSINE",
+            "db_name": _milvus_test_db,
+        }
+    else:
+        msg = f"Unknown Mem0 provider: {_mem0_provider}"
+        raise ValueError(msg)
+
     vs = Mem0VectorStore(
-        provider="chroma",
-        provider_config={"path": str(tmp_path)},
+        provider=_mem0_provider,
+        provider_config=provider_config,
         collection=collection,
     )
     vs.open()
+    _created_stores.append(vs)
     return vs
+
+
+def _use_strong_milvus_consistency(monkeypatch) -> None:
+    import mem0.vector_stores.milvus as mem0_milvus
+
+    class StrongConsistencyMilvusClient(mem0_milvus.MilvusClient):
+        def create_collection(self, *args: Any, **kwargs: Any) -> Any:
+            # Test-only: use STRONG consistency so the existing contract tests can
+            # assert read-after-write behavior without sleeps or retries.
+            kwargs.setdefault("consistency_level", _milvus_strong_consistency)
+            return super().create_collection(*args, **kwargs)
+
+    monkeypatch.setattr(mem0_milvus, "MilvusClient", StrongConsistencyMilvusClient)
+
+
+def _clear_milvus_test_database() -> None:
+    from pymilvus import MilvusClient
+
+    root_client = MilvusClient(uri=_milvus_uri, token=None)
+    if _milvus_test_db not in root_client.list_databases():
+        root_client.create_database(_milvus_test_db)
+
+    client = MilvusClient(uri=_milvus_uri, token=None, db_name=_milvus_test_db)
+    for name in client.list_collections():
+        client.drop_collection(name)
 
 
 # ---------------------------------------------------------------------------
